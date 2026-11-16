@@ -3552,6 +3552,7 @@ namespace PlanetX_AILens {
     //% color=#1C7ED6
     export function initAiLensPro(): void {
         initializeCameraInternal();
+        startAssistantCommandWorker();
     }
 
     //% block="switch function to %mode"
@@ -4477,6 +4478,201 @@ namespace PlanetX_AILens {
         }
         return soundTouchDurationSecCache;
     }
+    // Independent from foreground app result registers (100..959).
+    const ASSISTANT_COMMAND_UART = 0x49;
+    const ASSISTANT_MAILBOX_ADDR = 0x03C0;
+    const ASSISTANT_EVENT_SOURCE = 3510;
+    let assistantCommands: { id: number, description: string }[] = [];
+    let assistantSession = 0;
+    let assistantRevision = 0;
+    let assistantSyncedRevision = 0;
+    let assistantRequestSequence = 0;
+    let assistantWorkerStarted = false;
+    let assistantRegistrationError = false;
+    let assistantLastEvent = 0;
+    let assistantBootEpoch = 0;
+    let assistantLastHeartbeat = 0;
+
+    function assistantPutU32(buffer: Buffer, offset: number, value: number): void {
+        for (let i = 0; i < 4; i++) buffer[offset + i] = (value >>> (8 * i)) & 0xFF;
+    }
+
+    function assistantGetU32(buffer: Buffer, offset: number): number {
+        return (buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16) | (buffer[offset + 3] << 24)) >>> 0;
+    }
+
+    function assistantCrc32(buffer: Buffer): number {
+        let crc = 0xFFFFFFFF;
+        for (let i = 0; i < 60; i++) {
+            crc ^= buffer[i];
+            for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+        }
+        return (crc ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    function readAssistantMailbox(): Buffer {
+        const raw = regReadBytes(ASSISTANT_MAILBOX_ADDR, 64, 10, 2);
+        if (!raw || raw.length != 64 || raw[0] != 0x41 || raw[1] != 0x49 || raw[2] != 1 ||
+            assistantGetU32(raw, 60) != assistantCrc32(raw)) return pins.createBuffer(0);
+        return raw;
+    }
+
+    function assistantPacket(operation: number, revision: number, extra: Buffer): Buffer {
+        const payload = pins.createBuffer(14 + extra.length);
+        payload[0] = 1;
+        payload[1] = operation;
+        assistantRequestSequence = ((assistantRequestSequence + 1) >>> 0) || 1;
+        assistantPutU32(payload, 2, assistantRequestSequence);
+        assistantPutU32(payload, 6, assistantSession);
+        assistantPutU32(payload, 10, revision);
+        for (let i = 0; i < extra.length; i++) payload[14 + i] = extra[i];
+        return payload;
+    }
+
+    function assistantSendConfirmed(operation: number, revision: number, extra: Buffer): boolean {
+        const payload = assistantPacket(operation, revision, extra);
+        const sequence = assistantRequestSequence;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (!sendUartCommandBuffer(ASSISTANT_COMMAND_UART, payload)) {
+                basic.pause(100);
+                continue;
+            }
+            const deadline = input.runningTime() + 1000;
+            while (input.runningTime() < deadline) {
+                const status = readAssistantMailbox();
+                if (status.length == 64 && assistantGetU32(status, 4) == sequence &&
+                    assistantGetU32(status, 8) == assistantSession && assistantGetU32(status, 12) == revision) {
+                    return status[3] == 0;
+                }
+                basic.pause(50);
+            }
+        }
+        return false;
+    }
+
+    function syncAssistantCommands(): boolean {
+        const revision = assistantRevision;
+        const commands = assistantCommands.slice();
+        if (!assistantSendConfirmed(1, revision, pins.createBuffer(0))) return false;
+        for (let index = 0; index < commands.length; index++) {
+            const command = commands[index];
+            const text = utf8Encode(command.description);
+            // MCU I2C buffer is 50 bytes: 4 envelope + 2 forwarding + 4 UART + 18 header + 22 text.
+            for (let offset = 0; offset < text.length; offset += 22) {
+                const count = minNumber(22, text.length - offset);
+                const chunk = pins.createBuffer(4 + count);
+                putU16le(chunk, 0, command.id);
+                chunk[2] = text.length;
+                chunk[3] = offset;
+                for (let i = 0; i < count; i++) chunk[4 + i] = text[offset + i];
+                if (!assistantSendConfirmed(2, revision, chunk)) return false;
+            }
+        }
+        const count = pins.createBuffer(1);
+        count[0] = commands.length;
+        if (!assistantSendConfirmed(3, revision, count)) return false;
+        assistantSyncedRevision = revision;
+        return true;
+    }
+
+    function assistantCommandWorker(): void {
+        while (true) {
+            if (assistantRegistrationError) {
+                basic.pause(500);
+                continue;
+            }
+            if (assistantSyncedRevision != assistantRevision) {
+                if (!syncAssistantCommands()) basic.pause(1000);
+                continue;
+            }
+            if (input.runningTime() - assistantLastHeartbeat >= 1000) {
+                assistantLastHeartbeat = input.runningTime();
+                if (!assistantSendConfirmed(5, assistantSyncedRevision, pins.createBuffer(0))) {
+                    assistantSyncedRevision = 0;
+                    continue;
+                }
+            }
+            const status = readAssistantMailbox();
+            if (status.length == 64 && assistantGetU32(status, 8) == assistantSession &&
+                assistantGetU32(status, 12) == assistantSyncedRevision && status[23] == 1) {
+                const epoch = assistantGetU32(status, 24);
+                if (epoch != assistantBootEpoch) {
+                    assistantBootEpoch = epoch;
+                    assistantLastEvent = 0;
+                }
+                const event = assistantGetU32(status, 16);
+                const commandId = status[20] | (status[21] << 8);
+                if (event && status[22] > 0) {
+                    if (event != assistantLastEvent) {
+                        let registered = false;
+                        for (let i = 0; i < assistantCommands.length; i++)
+                            if (assistantCommands[i].id == commandId) registered = true;
+                        if (registered) {
+                            assistantLastEvent = event;
+                            control.raiseEvent(ASSISTANT_EVENT_SOURCE, commandId);
+                        }
+                    }
+                    const ack = pins.createBuffer(4);
+                    assistantPutU32(ack, 0, event);
+                    // ACK is repeatable; never raise the same event again on ACK loss.
+                    assistantSendConfirmed(4, assistantSyncedRevision, ack);
+                }
+            } else if (status.length == 64 && status[23] == 0) {
+                assistantSyncedRevision = 0;
+            }
+            basic.pause(50);
+        }
+    }
+
+    /** Register an LLM-selected micro:bit command. Say “积木指令，…” to invoke it. */
+    //% block="when AI assistant receives command %description ID %commandId"
+    //% description.defl="前进"
+    //% commandId.defl=1 commandId.min=1 commandId.max=65535
+    //% subcategory="AI Lens Pro" group="AI assistant"
+    //% weight=70 color=#1C7ED6
+    export function onAssistantCommand(description: string, commandId: number, handler: () => void): void {
+        const text = ("" + description).trim();
+        const ident = commandId | 0;
+        if (!text || utf8Encode(text).length > 180 || ident < 1 || ident > 65535 || assistantCommands.length >= 32) {
+            assistantRegistrationError = true;
+            return;
+        }
+        let found = false;
+        for (let i = 0; i < assistantCommands.length; i++) {
+            if (assistantCommands[i].id == ident) {
+                if (assistantCommands[i].description != text) assistantRegistrationError = true;
+                found = true;
+            }
+        }
+        if (assistantRegistrationError) return;
+        control.onEvent(ASSISTANT_EVENT_SOURCE, ident, handler);
+        if (!found) {
+            assistantCommands.push({ id: ident, description: text });
+            assistantRevision = ((assistantRevision + 1) >>> 0) || 1;
+        }
+        startAssistantCommandWorker();
+    }
+
+    function startAssistantCommandWorker(): void {
+        if (!assistantWorkerStarted) {
+            if (!assistantRevision) assistantRevision = 1;
+            assistantWorkerStarted = true;
+            assistantSession = Math.randomRange(1, 0x7FFFFFFF);
+            control.inBackground(() => {
+                basic.pause(200); // Collect startup event blocks before sending the first table.
+                assistantCommandWorker();
+            });
+        }
+    }
+
+    /** Whether this program's command table has been saved by AI Lens Pro. */
+    //% block="AI assistant commands registered"
+    //% subcategory="AI Lens Pro" group="AI assistant"
+    //% weight=69 color=#1C7ED6
+    export function assistantCommandsReady(): boolean {
+        return !assistantRegistrationError && assistantRevision > 0 && assistantSyncedRevision == assistantRevision;
+    }
+
 }
 
 /************************************************************************

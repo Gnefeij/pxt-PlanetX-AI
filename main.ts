@@ -4492,28 +4492,56 @@ namespace PlanetX_AILens {
     let assistantLastEvent = 0;
     let assistantBootEpoch = 0;
     let assistantLastHeartbeat = 0;
+    // 0 waiting, 1 I2C read failed, 2 bad header, 3 CRC mismatch,
+    // 4 confirmation mismatch/timeout, 5 registered, 6 invalid command.
+    let assistantDiagnostic = 0;
 
     function assistantPutU32(buffer: Buffer, offset: number, value: number): void {
         for (let i = 0; i < 4; i++) buffer[offset + i] = (value >>> (8 * i)) & 0xFF;
     }
 
     function assistantGetU32(buffer: Buffer, offset: number): number {
-        return (buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16) | (buffer[offset + 3] << 24)) >>> 0;
+        return buffer[offset] + buffer[offset + 1] * 256 + buffer[offset + 2] * 65536 + buffer[offset + 3] * 16777216;
     }
 
-    function assistantCrc32(buffer: Buffer): number {
-        let crc = 0xFFFFFFFF;
+    function assistantMailboxCrcValid(buffer: Buffer): boolean {
+        // Keep all intermediates within 16 bits. This avoids unsigned 32-bit
+        // number representation differences between JS and micro:bit native.
+        let low = 0xFFFF;
+        let high = 0xFFFF;
         for (let i = 0; i < 60; i++) {
-            crc ^= buffer[i];
-            for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+            low ^= buffer[i];
+            for (let bit = 0; bit < 8; bit++) {
+                const odd = low & 1;
+                low = (low >> 1) | ((high & 1) << 15);
+                high = high >> 1;
+                if (odd) {
+                    low ^= 0x8320;
+                    high ^= 0xEDB8;
+                }
+            }
         }
-        return (crc ^ 0xFFFFFFFF) >>> 0;
+        low ^= 0xFFFF;
+        high ^= 0xFFFF;
+        return buffer[60] == (low & 255) && buffer[61] == (low >> 8) &&
+            buffer[62] == (high & 255) && buffer[63] == (high >> 8);
     }
 
     function readAssistantMailbox(): Buffer {
         const raw = regReadBytes(ASSISTANT_MAILBOX_ADDR, 64, 10, 2);
-        if (!raw || raw.length != 64 || raw[0] != 0x41 || raw[1] != 0x49 || raw[2] != 1 ||
-            assistantGetU32(raw, 60) != assistantCrc32(raw)) return pins.createBuffer(0);
+        if (!raw || raw.length != 64) {
+            assistantDiagnostic = 1;
+            return pins.createBuffer(0);
+        }
+        if (raw[0] != 0x41 || raw[1] != 0x49 || raw[2] != 1) {
+            assistantDiagnostic = 2;
+            return pins.createBuffer(0);
+        }
+        if (!assistantMailboxCrcValid(raw)) {
+            assistantDiagnostic = 3;
+            return pins.createBuffer(0);
+        }
+        assistantDiagnostic = 4;
         return raw;
     }
 
@@ -4572,6 +4600,7 @@ namespace PlanetX_AILens {
         count[0] = commands.length;
         if (!assistantSendConfirmed(3, revision, count)) return false;
         assistantSyncedRevision = revision;
+        assistantDiagnostic = 5;
         return true;
     }
 
@@ -4635,6 +4664,7 @@ namespace PlanetX_AILens {
         const ident = commandId | 0;
         if (!text || utf8Encode(text).length > 180 || ident < 1 || ident > 65535 || assistantCommands.length >= 32) {
             assistantRegistrationError = true;
+            assistantDiagnostic = 6;
             return;
         }
         let found = false;
@@ -4671,6 +4701,14 @@ namespace PlanetX_AILens {
     //% weight=69 color=#1C7ED6
     export function assistantCommandsReady(): boolean {
         return !assistantRegistrationError && assistantRevision > 0 && assistantSyncedRevision == assistantRevision;
+    }
+
+    /** 1=I2C read, 2=mailbox header, 3=CRC, 4=confirmation, 5=registered, 6=invalid command. */
+    //% block="AI assistant registration diagnostic"
+    //% subcategory="AI Lens Pro" group="AI assistant"
+    //% weight=68 color=#1C7ED6
+    export function assistantRegistrationDiagnostic(): number {
+        return assistantCommandsReady() ? 5 : assistantDiagnostic;
     }
 
 }

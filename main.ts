@@ -4511,6 +4511,39 @@ namespace PlanetX_AILens {
         return result;
     }
 
+    function assistantUtf8(text: string): Buffer {
+        // Do not use control.createBufferFromUTF8 here: on the target it
+        // produced the low byte of each Chinese code unit (前进 -> 4d db).
+        const bytes: number[] = [];
+        for (let i = 0; i < text.length; i++) {
+            let code = text.charCodeAt(i);
+            if (code >= 0xD800 && code <= 0xDBFF) {
+                const next = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
+                if (next >= 0xDC00 && next <= 0xDFFF) {
+                    code = 0x10000 + ((code - 0xD800) << 10) + next - 0xDC00;
+                    i++;
+                } else code = 0xFFFD;
+            } else if (code >= 0xDC00 && code <= 0xDFFF) code = 0xFFFD;
+            if (code < 0x80) bytes.push(code);
+            else if (code < 0x800) {
+                bytes.push(0xC0 | (code >> 6));
+                bytes.push(0x80 | (code & 0x3F));
+            } else if (code < 0x10000) {
+                bytes.push(0xE0 | (code >> 12));
+                bytes.push(0x80 | ((code >> 6) & 0x3F));
+                bytes.push(0x80 | (code & 0x3F));
+            } else {
+                bytes.push(0xF0 | (code >> 18));
+                bytes.push(0x80 | ((code >> 12) & 0x3F));
+                bytes.push(0x80 | ((code >> 6) & 0x3F));
+                bytes.push(0x80 | (code & 0x3F));
+            }
+        }
+        const result = pins.createBuffer(bytes.length);
+        for (let i = 0; i < bytes.length; i++) result[i] = bytes[i];
+        return result;
+    }
+
     function assistantMailboxCrcValid(buffer: Buffer): boolean {
         // Keep all intermediates within 16 bits. This avoids unsigned 32-bit
         // number representation differences between JS and micro:bit native.
@@ -4606,7 +4639,7 @@ namespace PlanetX_AILens {
         if (!assistantSendConfirmed(1, revision, pins.createBuffer(0))) return false;
         for (let index = 0; index < commands.length; index++) {
             const command = commands[index];
-            const text = utf8Encode(command.description);
+            const text = assistantUtf8(command.description);
             // MCU I2C buffer is 50 bytes: 4 envelope + 2 forwarding + 4 UART + 18 header + 22 text.
             for (let offset = 0; offset < text.length; offset += 22) {
                 const count = minNumber(22, text.length - offset);
@@ -4683,7 +4716,7 @@ namespace PlanetX_AILens {
     export function onAssistantCommand(description: string, commandId: number, handler: () => void): void {
         const text = ("" + description).trim();
         const ident = commandId | 0;
-        if (!text || utf8Encode(text).length > 180 || ident < 1 || ident > 65535 || assistantCommands.length >= 32) {
+        if (!text || assistantUtf8(text).length > 180 || ident < 1 || ident > 65535 || assistantCommands.length >= 32) {
             assistantRegistrationError = true;
             assistantDiagnostic = 6;
             return;

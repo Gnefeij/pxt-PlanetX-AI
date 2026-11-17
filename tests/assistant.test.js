@@ -9,7 +9,7 @@ assert.strictEqual(compiled.diagnostics.length, 0);
 function crc8(bytes) { let crc=0; for (const byte of bytes) { crc^=byte; for(let b=0;b<8;b++) crc=((crc<<1)^((crc&128)?7:0))&255; } return crc; }
 function crc32(bytes) { let crc=0xffffffff; for(const byte of bytes) {crc^=byte;for(let b=0;b<8;b++)crc=(crc>>>1)^((crc&1)?0xedb88320:0);}return (crc^0xffffffff)>>>0; }
 
-function simulation(duplicate=false, staleAck=false, sessionValue=123, eventStart=0) {
+function simulation(duplicate=false, staleAck=false, sessionValue=123, eventStart=0, description='向前移动'.repeat(10)) {
     let now=0, readAddress=0, readLength=0, callbacks=0, ignoreAck=true;
     let session=0, revision=0, ready=false, request=0, event=0, reports=0;
     const mailbox=Buffer.alloc(64), chunks=new Map(), tasks=[], handlers=new Map(), frames=[];
@@ -59,12 +59,13 @@ function simulation(duplicate=false, staleAck=false, sessionValue=123, eventStar
             output[length-1]=crc8(output.subarray(0,-1));return output;
         }},
         input:{runningTime:()=>++now},basic:{pause:ms=>{now+=ms;if(now>4500)throw stopped;}},
-        control:{createBufferFromUTF8:text=>Buffer.from(text),inBackground:fn=>tasks.push(fn),onEvent:(source,id,handler)=>handlers.set(id,handler),
+        // Reproduce the observed target helper: 前进 was sent as 4d db.
+        control:{createBufferFromUTF8:text=>Buffer.from(Array.from(text,c=>c.charCodeAt(0)&255)),inBackground:fn=>tasks.push(fn),onEvent:(source,id,handler)=>handlers.set(id,handler),
                  raiseEvent:(source,id)=>{assert.strictEqual(source,3510);handlers.get(id)();}}
     };
     vm.createContext(context);vm.runInContext(compiled.outputText,context);
     const api=context.PlanetX_AILens;
-    const description='向前移动'.repeat(10); // 120 UTF-8 bytes, deliberately crosses chunk boundaries.
+    // Default: 120 UTF-8 bytes, deliberately crosses chunk boundaries.
     api.onAssistantCommand(description,7,()=>callbacks++);
     api.onAssistantCommand(duplicate?'不同描述':'停止移动',duplicate?7:8,()=>{});
     assert.strictEqual(tasks.length,1,'one polling fiber per program');
@@ -82,4 +83,5 @@ simulation();simulation(true);
 assert.strictEqual(simulation(false,true),2,'stale registration ACK and deliberately lost event ACK are reported before retries succeed');
 simulation(false,false,1561532238,0x01000000);
 simulation(false,false,0x7fffffff,0xffffff00);
+simulation(false,false,123,0,'前进😀Aé');
 console.log('MakeCode assistant registration, UTF-8 chunks, CRC, repeated events and conflicting IDs passed');

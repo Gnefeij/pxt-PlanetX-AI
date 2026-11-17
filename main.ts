@@ -4561,6 +4561,7 @@ namespace PlanetX_AILens {
         const payload = assistantPacket(operation, revision, extra);
         const sequence = assistantRequestSequence;
         for (let attempt = 0; attempt < 3; attempt++) {
+            let lastStatus = pins.createBuffer(0);
             if (!sendUartCommandBuffer(ASSISTANT_COMMAND_UART, payload)) {
                 basic.pause(100);
                 continue;
@@ -4568,14 +4569,28 @@ namespace PlanetX_AILens {
             const deadline = input.runningTime() + 1000;
             while (input.runningTime() < deadline) {
                 const status = readAssistantMailbox();
+                if (status.length == 64) lastStatus = status;
                 if (status.length == 64 && assistantGetU32(status, 4) == sequence &&
                     assistantGetU32(status, 8) == assistantSession && assistantGetU32(status, 12) == revision) {
+                    if (status[3] != 0) assistantReportConfirmation(payload, status);
                     return status[3] == 0;
                 }
                 basic.pause(50);
             }
+            if (lastStatus.length == 64) assistantReportConfirmation(payload, lastStatus);
         }
         return false;
+    }
+
+    function assistantReportConfirmation(request: Buffer, status: Buffer): void {
+        // Passive diagnostic: preserve the expected key and include the actual
+        // CRC-validated header read over I2C. Linux must not ACK this message.
+        // 14 + 24 payload + 4 UART + 2 forwarding + 4 I2C = 48 bytes (<50).
+        const report = pins.createBuffer(38);
+        for (let i = 0; i < 14; i++) report[i] = request[i];
+        report[1] = 6;
+        for (let i = 0; i < 24; i++) report[14 + i] = status[i];
+        sendUartCommandBuffer(ASSISTANT_COMMAND_UART, report);
     }
 
     function syncAssistantCommands(): boolean {

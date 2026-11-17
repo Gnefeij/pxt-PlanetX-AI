@@ -9,13 +9,14 @@ assert.strictEqual(compiled.diagnostics.length, 0);
 function crc8(bytes) { let crc=0; for (const byte of bytes) { crc^=byte; for(let b=0;b<8;b++) crc=((crc<<1)^((crc&128)?7:0))&255; } return crc; }
 function crc32(bytes) { let crc=0xffffffff; for(const byte of bytes) {crc^=byte;for(let b=0;b<8;b++)crc=(crc>>>1)^((crc&1)?0xedb88320:0);}return (crc^0xffffffff)>>>0; }
 
-function simulation(duplicate=false) {
+function simulation(duplicate=false, staleAck=false) {
     let now=0, readAddress=0, readLength=0, callbacks=0, ignoreAck=true;
-    let session=0, revision=0, ready=false, request=0, event=0;
+    let session=0, revision=0, ready=false, request=0, event=0, reports=0;
     const mailbox=Buffer.alloc(64), chunks=new Map(), tasks=[], handlers=new Map(), frames=[];
     const stopped = new Error('end simulation');
     function update() {
         mailbox.fill(0);mailbox.write('AI');mailbox[2]=1;mailbox.writeUInt32LE(request,4);
+        if(staleAck)mailbox.writeUInt32LE(request-1,4);
         mailbox.writeUInt32LE(session,8);mailbox.writeUInt32LE(revision,12);
         mailbox.writeUInt32LE(event,16);mailbox.writeUInt16LE(event?7:0,20);
         mailbox[22]=event?1:0;mailbox[23]=ready?1:0;mailbox.writeUInt32LE(42,24);
@@ -33,6 +34,13 @@ function simulation(duplicate=false) {
             assert.strictEqual(uart[2],0x49);const payload=uart.subarray(4);
             assert.strictEqual(uart[3],payload.length);
             const operation=payload[1], seq=payload.readUInt32LE(2);
+            if(operation===6){
+                reports++;
+                assert.strictEqual(payload.length,38);
+                assert.strictEqual(payload.subarray(14,16).toString(),'AI');
+                assert.strictEqual(payload.readUInt32LE(18),seq-1);
+                staleAck=false;update();return;
+            }
             session=payload.readUInt32LE(6);revision=payload.readUInt32LE(10);
             if(operation===4 && ignoreAck){ignoreAck=false;return;}
             request=seq;
@@ -67,7 +75,9 @@ function simulation(duplicate=false) {
         assert.strictEqual(chunks.get(8).toString(),'停止移动');
         assert.strictEqual(callbacks,2,'same command in distinct events fires twice; ACK retry does not repeat callback');
         assert.strictEqual(api.assistantCommandsReady(),true);
+        return reports;
     }
 }
 simulation();simulation(true);
+assert.strictEqual(simulation(false,true),2,'stale registration ACK and deliberately lost event ACK are reported before retries succeed');
 console.log('MakeCode assistant registration, UTF-8 chunks, CRC, repeated events and conflicting IDs passed');

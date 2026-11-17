@@ -4489,8 +4489,8 @@ namespace PlanetX_AILens {
     let assistantRequestSequence = 0;
     let assistantWorkerStarted = false;
     let assistantRegistrationError = false;
-    let assistantLastEvent = 0;
-    let assistantBootEpoch = 0;
+    let assistantLastEvent = pins.createBuffer(4);
+    let assistantBootEpoch = pins.createBuffer(4);
     let assistantLastHeartbeat = 0;
     // 0 waiting, 1 I2C read failed, 2 bad header, 3 CRC mismatch,
     // 4 confirmation mismatch/timeout, 5 registered, 6 invalid command.
@@ -4500,8 +4500,15 @@ namespace PlanetX_AILens {
         for (let i = 0; i < 4; i++) buffer[offset + i] = (value >>> (8 * i)) & 0xFF;
     }
 
-    function assistantGetU32(buffer: Buffer, offset: number): number {
-        return buffer[offset] + buffer[offset + 1] * 256 + buffer[offset + 2] * 65536 + buffer[offset + 3] * 16777216;
+    function assistantBytesEqual(a: Buffer, aOffset: number, b: Buffer, bOffset: number, count: number): boolean {
+        for (let i = 0; i < count; i++) if (a[aOffset + i] != b[bOffset + i]) return false;
+        return true;
+    }
+
+    function assistantCopyBytes(source: Buffer, offset: number, count: number): Buffer {
+        const result = pins.createBuffer(count);
+        for (let i = 0; i < count; i++) result[i] = source[offset + i];
+        return result;
     }
 
     function assistantMailboxCrcValid(buffer: Buffer): boolean {
@@ -4559,7 +4566,6 @@ namespace PlanetX_AILens {
 
     function assistantSendConfirmed(operation: number, revision: number, extra: Buffer): boolean {
         const payload = assistantPacket(operation, revision, extra);
-        const sequence = assistantRequestSequence;
         for (let attempt = 0; attempt < 3; attempt++) {
             let lastStatus = pins.createBuffer(0);
             if (!sendUartCommandBuffer(ASSISTANT_COMMAND_UART, payload)) {
@@ -4570,8 +4576,9 @@ namespace PlanetX_AILens {
             while (input.runningTime() < deadline) {
                 const status = readAssistantMailbox();
                 if (status.length == 64) lastStatus = status;
-                if (status.length == 64 && assistantGetU32(status, 4) == sequence &&
-                    assistantGetU32(status, 8) == assistantSession && assistantGetU32(status, 12) == revision) {
+                // Compare the exact bytes sent. Native micro:bit number
+                // arithmetic can lose precision when rebuilding a uint32.
+                if (status.length == 64 && assistantBytesEqual(status, 4, payload, 2, 12)) {
                     if (status[3] != 0) assistantReportConfirmation(payload, status);
                     return status[3] == 0;
                 }
@@ -4637,17 +4644,18 @@ namespace PlanetX_AILens {
                 }
             }
             const status = readAssistantMailbox();
-            if (status.length == 64 && assistantGetU32(status, 8) == assistantSession &&
-                assistantGetU32(status, 12) == assistantSyncedRevision && status[23] == 1) {
-                const epoch = assistantGetU32(status, 24);
-                if (epoch != assistantBootEpoch) {
-                    assistantBootEpoch = epoch;
-                    assistantLastEvent = 0;
+            const expectedKey = pins.createBuffer(8);
+            assistantPutU32(expectedKey, 0, assistantSession);
+            assistantPutU32(expectedKey, 4, assistantSyncedRevision);
+            if (status.length == 64 && assistantBytesEqual(status, 8, expectedKey, 0, 8) && status[23] == 1) {
+                if (!assistantBytesEqual(status, 24, assistantBootEpoch, 0, 4)) {
+                    assistantBootEpoch = assistantCopyBytes(status, 24, 4);
+                    assistantLastEvent = pins.createBuffer(4);
                 }
-                const event = assistantGetU32(status, 16);
+                const event = assistantCopyBytes(status, 16, 4);
                 const commandId = status[20] | (status[21] << 8);
-                if (event && status[22] > 0) {
-                    if (event != assistantLastEvent) {
+                if ((event[0] || event[1] || event[2] || event[3]) && status[22] > 0) {
+                    if (!assistantBytesEqual(event, 0, assistantLastEvent, 0, 4)) {
                         let registered = false;
                         for (let i = 0; i < assistantCommands.length; i++)
                             if (assistantCommands[i].id == commandId) registered = true;
@@ -4656,10 +4664,8 @@ namespace PlanetX_AILens {
                             control.raiseEvent(ASSISTANT_EVENT_SOURCE, commandId);
                         }
                     }
-                    const ack = pins.createBuffer(4);
-                    assistantPutU32(ack, 0, event);
                     // ACK is repeatable; never raise the same event again on ACK loss.
-                    assistantSendConfirmed(4, assistantSyncedRevision, ack);
+                    assistantSendConfirmed(4, assistantSyncedRevision, event);
                 }
             } else if (status.length == 64 && status[23] == 0) {
                 assistantSyncedRevision = 0;

@@ -4482,7 +4482,8 @@ namespace PlanetX_AILens {
     const ASSISTANT_COMMAND_UART = 0x49;
     const ASSISTANT_MAILBOX_ADDR = 0x03C0;
     const ASSISTANT_EVENT_SOURCE = 3510;
-    let assistantCommands: { id: number, description: string }[] = [];
+    let assistantCommands: { id: number, description: string, handlers: (() => void)[] }[] = [];
+    let assistantNextCommandId = 1;
     let assistantSession = 0;
     let assistantRevision = 0;
     let assistantSyncedRevision = 0;
@@ -4512,8 +4513,9 @@ namespace PlanetX_AILens {
     }
 
     function assistantUtf8(text: string): Buffer {
-        // Do not use control.createBufferFromUTF8 here: on the target it
-        // produced the low byte of each Chinese code unit (前进 -> 4d db).
+        // pxt.json must enable utf8 so the compiler preserves native Unicode
+        // literals. Encoding cannot recover characters already truncated by
+        // a non-Unicode target. Emit the wire bytes explicitly here.
         const bytes: number[] = [];
         for (let i = 0; i < text.length; i++) {
             let code = text.charCodeAt(i);
@@ -4637,6 +4639,7 @@ namespace PlanetX_AILens {
         const revision = assistantRevision;
         const commands = assistantCommands.slice();
         if (!assistantSendConfirmed(1, revision, pins.createBuffer(0))) return false;
+        if (revision != assistantRevision) return false;
         for (let index = 0; index < commands.length; index++) {
             const command = commands[index];
             const text = assistantUtf8(command.description);
@@ -4649,11 +4652,13 @@ namespace PlanetX_AILens {
                 chunk[3] = offset;
                 for (let i = 0; i < count; i++) chunk[4 + i] = text[offset + i];
                 if (!assistantSendConfirmed(2, revision, chunk)) return false;
+                if (revision != assistantRevision) return false;
             }
         }
         const count = pins.createBuffer(1);
         count[0] = commands.length;
         if (!assistantSendConfirmed(3, revision, count)) return false;
+        if (revision != assistantRevision) return false;
         assistantSyncedRevision = revision;
         assistantDiagnostic = 5;
         return true;
@@ -4708,32 +4713,62 @@ namespace PlanetX_AILens {
     }
 
     /** Register an LLM-selected micro:bit command. Say “积木指令，…” to invoke it. */
-    //% block="when AI assistant receives command %description ID %commandId"
+    //% block="when AI assistant receives command %description"
     //% description.defl="前进"
-    //% commandId.defl=1 commandId.min=1 commandId.max=65535
     //% subcategory="AI Lens Pro" group="AI assistant"
     //% weight=70 color=#1C7ED6
-    export function onAssistantCommand(description: string, commandId: number, handler: () => void): void {
+    export function onAssistantCommand(description: string, handler: () => void): void {
         const text = ("" + description).trim();
-        const ident = commandId | 0;
-        if (!text || assistantUtf8(text).length > 180 || ident < 1 || ident > 65535 || assistantCommands.length >= 32) {
+        if (!text || assistantUtf8(text).length > 180) {
             assistantRegistrationError = true;
             assistantDiagnostic = 6;
             return;
         }
-        let found = false;
         for (let i = 0; i < assistantCommands.length; i++) {
-            if (assistantCommands[i].id == ident) {
-                if (assistantCommands[i].description != text) assistantRegistrationError = true;
-                found = true;
+            if (assistantCommands[i].description == text) {
+                assistantCommands[i].handlers.push(handler);
+                return;
             }
         }
-        if (assistantRegistrationError) return;
-        control.onEvent(ASSISTANT_EVENT_SOURCE, ident, handler);
-        if (!found) {
-            assistantCommands.push({ id: ident, description: text });
-            assistantRevision = ((assistantRevision + 1) >>> 0) || 1;
+        if (assistantCommands.length >= 32 || assistantNextCommandId > 65535) {
+            assistantRegistrationError = true;
+            assistantDiagnostic = 6;
+            return;
         }
+        if (assistantRegistrationError) return;
+        const ident = assistantNextCommandId++;
+        assistantCommands.push({ id: ident, description: text, handlers: [handler] });
+        control.onEvent(ASSISTANT_EVENT_SOURCE, ident, () => {
+            // Clear removes the live entry. IDs are never reused in this boot,
+            // so stale events cannot invoke a cleared command's old handler.
+            for (let i = 0; i < assistantCommands.length; i++) {
+                if (assistantCommands[i].id == ident) {
+                    const callbacks = assistantCommands[i].handlers.slice();
+                    for (let j = 0; j < callbacks.length; j++) {
+                        let active = false;
+                        for (let k = 0; k < assistantCommands.length; k++)
+                            if (assistantCommands[k].id == ident) active = true;
+                        if (active) callbacks[j]();
+                    }
+                    return;
+                }
+            }
+        });
+        assistantRevision = ((assistantRevision + 1) >>> 0) || 1;
+        startAssistantCommandWorker();
+    }
+
+    /** Remove all commands from this program and sync an empty table to AI Lens Pro. */
+    //% block="clear AI assistant commands"
+    //% subcategory="AI Lens Pro" group="AI assistant"
+    //% weight=67 color=#1C7ED6
+    export function clearAssistantCommands(): void {
+        assistantCommands = [];
+        assistantRegistrationError = false;
+        assistantRevision = ((assistantRevision + 1) >>> 0) || 1;
+        assistantSyncedRevision = 0;
+        assistantLastEvent = pins.createBuffer(4);
+        assistantDiagnostic = 0;
         startAssistantCommandWorker();
     }
 

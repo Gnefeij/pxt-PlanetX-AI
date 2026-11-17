@@ -535,7 +535,8 @@
   "{id:group}Self learning": "特征学习",
   "{id:group}Rhythm recognition": "节奏识别",
   "{id:subcategory}AI Lens Pro": "AI Lens Pro",
-  "PlanetX_AILens.onAssistantCommand|block": "当 AI 助手收到命令 %description ID %commandId",
+  "PlanetX_AILens.onAssistantCommand|block": "当 AI 助手收到命令 %description",
+  "PlanetX_AILens.clearAssistantCommands|block": "清空 AI 助手指令",
   "PlanetX_AILens.assistantCommandsReady|block": "AI 助手命令已注册",
   "PlanetX_AILens.assistantRegistrationDiagnostic|block": "AI 助手注册诊断码",
   "PlanetX_AILens.group.AI assistant": "AI 助手"
